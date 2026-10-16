@@ -1,0 +1,5 @@
+#examples:
+#SetTradedMonPokedexFlags 080507A0 1
+
+# Replace the vanilla title screen init (CB2_InitTitleScreen, BPRE 1.0) with ours.
+CB2_InitSupaTitle 08078914 0
