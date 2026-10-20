@@ -28,6 +28,32 @@
 #include "../include/sprite.h"
 #include "../include/task.h"
 #include "../include/constants/songs.h"
+
+// ---- Save loading (vanilla does this when START is pressed on the title screen) ----
+// FireRed does NOT load the save before the title screen. The vanilla title screen loads it
+// on exit (SetTitleScreenScene_Cry). If we skip it, the save blocks / PC boxes are never set up.
+#ifndef HEAP_SIZE
+#define HEAP_SIZE 0x1C000
+#endif
+#ifndef SAVE_NORMAL
+#define SAVE_NORMAL 0
+#endif
+#ifndef SAVE_STATUS_EMPTY
+#define SAVE_STATUS_EMPTY 0
+#endif
+#ifndef SAVE_STATUS_INVALID
+#define SAVE_STATUS_INVALID 2
+#endif
+extern u8 gHeap[];
+extern u16 gSaveFileStatus;
+void InitHeap(void *pointer, u32 size);
+void SeedRngAndSetTrainerId(void);
+void SetSaveBlocksPointers(void);
+void ResetMenuAndMonGlobals(void);
+void Save_ResetSaveCounters(void);
+u8 LoadGameSave(u8 saveType);
+void Sav2_ClearSetDefault(void);
+void SetPokemonCryStereo(u32 val);
 #include "../include/constants/species.h"
 #include "../include/gba/types.h"
 #include "../include/new/Vanilla_functions.h"
@@ -542,6 +568,18 @@ static void FinishTitle(void)
     // PlayCry_Normal ducks the music and restores it from a task, but the main menu
     // clears all tasks. Restore the volume ourselves so the music is never left quiet.
     m4aMPlayVolumeControl(&gMPlayInfo_BGM, 0xFFFF, 256);
+
+    // Exactly what vanilla SetTitleScreenScene_Cry does before the main menu:
+    SeedRngAndSetTrainerId();
+    SetSaveBlocksPointers();
+    ResetMenuAndMonGlobals();
+    Save_ResetSaveCounters();
+    LoadGameSave(SAVE_NORMAL);
+    if (gSaveFileStatus == SAVE_STATUS_EMPTY || gSaveFileStatus == SAVE_STATUS_INVALID)
+        Sav2_ClearSetDefault();
+    SetPokemonCryStereo(gSaveBlock2->optionsSound);
+    InitHeap(gHeap, HEAP_SIZE);
+
     gMain.state = 0; // the main menu init expects a fresh state
     SetMainCallback2(CB2_InitMainMenu);
 }
@@ -610,16 +648,22 @@ void CB2_InitSupaTitle(void)
 
     SetVBlankCallback(NULL);
     SetHBlankCallback(NULL);
+    StartTimer1();                 // vanilla does this; SeedRngAndSetTrainerId uses timer 1
+    InitHeap(gHeap, HEAP_SIZE);    // vanilla re-inits the heap here too
     ScanlineEffect_Stop();
 
     DmaFill16(3, 0, VRAM, VRAM_SIZE);
     DmaFill32(3, 0, OAM, OAM_SIZE);
     DmaFill16(3, 0, PLTT, PLTT_SIZE);
 
-    ResetPaletteFade();
-    ResetSpriteData();
+    // Same reset sequence the (working) Pokegear screen uses.
+    ScanlineEffect_Stop();
     ResetTasks();
+    ResetSpriteData();
+    ResetTempTileDataBuffers();
+    ResetPaletteFade();
     FreeAllSpritePalettes();
+    ResetBgsAndClearDma3BusyFlags(0);   // clears leftover BG manager / DMA3 request state
 
     SetGpuReg(REG_OFFSET_DISPCNT, 0);
     SetGpuReg(REG_OFFSET_BG0CNT, TITLE_BG0CNT);
@@ -647,6 +691,10 @@ void CB2_InitSupaTitle(void)
     SetGpuReg(REG_OFFSET_BG3HOFS, 0);
     SetGpuReg(REG_OFFSET_BG3VOFS, 0);
     SetGpuReg(REG_OFFSET_MOSAIC, 0);
+    SetGpuReg(REG_OFFSET_WIN0H, 0);
+    SetGpuReg(REG_OFFSET_WIN0V, 0);
+    SetGpuReg(REG_OFFSET_WININ, 0);
+    SetGpuReg(REG_OFFSET_WINOUT, 0);
     SetGpuReg(REG_OFFSET_BLDCNT, 0);
     SetGpuReg(REG_OFFSET_BLDALPHA, 0);
     SetGpuReg(REG_OFFSET_BLDY, 0);

@@ -1903,3 +1903,14 @@ SetBGMVolume_SuppressHelpSystemReduction = 0x8072474 | 1;
 BGMVolumeMax_EnableHelpSystemReduction = 0x807249c | 1;
 /* Title screen cry (from pokefirered.sym, BPRE 1.0) */
 PlayCry_Normal = 0x08071DF0 | 1;
+/* Save loading + heap, used by the title screen (from pokefirered.sym, BPRE 1.0) */
+gHeap = 0x02000000;
+gSaveFileStatus = 0x030053A0;
+InitHeap = 0x08002B80 | 1;
+StartTimer1 = 0x08000558 | 1;
+SeedRngAndSetTrainerId = 0x08000564 | 1;
+SetSaveBlocksPointers = 0x0804C058 | 1;
+ResetMenuAndMonGlobals = 0x08054A28 | 1;
+Sav2_ClearSetDefault = 0x08054A18 | 1;
+Save_ResetSaveCounters = 0x080D9750 | 1;
+LoadGameSave = 0x080DA4FC | 1;
