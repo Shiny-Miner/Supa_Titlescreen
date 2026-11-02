@@ -396,7 +396,13 @@ static void LoadTitleSubtitle(void)
 #endif // TITLE_SUBTITLE
 
 // =================================================================================
-// Animated affine Pokemon + shadow (OBJ)
+// Pixel-perfect animated Pokemon + shadow (OBJ)
+//
+// No affine scaling or rotation is used: those resample the sprite with nearest-neighbour
+// every frame, which is what makes pixel art shimmer. Instead, at start-up the Pokemon's
+// own front sprite is re-drawn into a handful of POSES (squashed, stretched, leaning) using
+// whole-pixel row/column mapping, like hand-drawn animation frames. At run time the sprite
+// just copies one finished pose into OBJ VRAM when it changes and moves by whole pixels.
 // =================================================================================
 #if TITLE_MON_SPECIES != 0
 
@@ -407,12 +413,179 @@ extern const struct TitleSheetEntry   gMonFrontPicTable[];
 extern const struct TitlePaletteEntry gMonPaletteTable[];
 
 #define TITLE_MON_TILES_VRAM (VRAM + 0x10000)   // OBJ tile 0
-#define TITLE_MON_POP_FRAMES 24
+#define MON_W        64
+#define MON_H        64
+#define MON_BYTES    0x800                      // 64 tiles of 4bpp
 
-// 64x64, 16 colours, double-size affine so rotation never clips.
+// BEGIN_POSE_ENGINE (extracted by a host test harness; keep free of game calls)
+struct TitlePose
+{
+    s8 dw;      // content width  change in pixels (+ = wider)
+    s8 dh;      // content height change in pixels (+ = taller)
+    s8 lean;    // pixels the top of the sprite is pushed right (feet stay put)
+};
+
+struct MonBounds { s32 minX, maxX, minY, maxY; };
+
+// Unpacks 4bpp tile-ordered sprite data (8 tiles per row) into one byte per pixel.
+static void UnpackMon(const u8 *tiles, u8 *lin)
+{
+    s32 x, y;
+
+    for (y = 0; y < MON_H; y++)
+    {
+        for (x = 0; x < MON_W; x++)
+        {
+            u8 b = tiles[((y >> 3) * 8 + (x >> 3)) * 32 + (y & 7) * 4 + ((x & 7) >> 1)];
+
+            lin[y * MON_W + x] = (x & 1) ? (b >> 4) : (b & 0xF);
+        }
+    }
+}
+
+static void FindMonBounds(const u8 *lin, struct MonBounds *b)
+{
+    s32 x, y;
+
+    b->minX = MON_W; b->maxX = -1; b->minY = MON_H; b->maxY = -1;
+    for (y = 0; y < MON_H; y++)
+    {
+        for (x = 0; x < MON_W; x++)
+        {
+            if (lin[y * MON_W + x] == 0)
+                continue;
+            if (x < b->minX) b->minX = x;
+            if (x > b->maxX) b->maxX = x;
+            if (y < b->minY) b->minY = y;
+            if (y > b->maxY) b->maxY = y;
+        }
+    }
+    if (b->maxX < 0)    // empty sprite: treat the whole canvas as content
+    {
+        b->minX = 0; b->maxX = MON_W - 1; b->minY = 0; b->maxY = MON_H - 1;
+    }
+}
+
+static s32 FloorDiv(s32 n, s32 d)   // d > 0
+{
+    return n >= 0 ? n / d : -((-n + d - 1) / d);
+}
+
+// Re-draws the sprite into `dst` (MON_BYTES, must be zeroed) with the given pose. The feet
+// (bottom row of the content) and the horizontal centre stay fixed. Everything is integer
+// math on pixel centres, so a given pose always produces exactly the same pixels, and the
+// per-pixel loop contains no divisions.
+static void RenderMonPose(const u8 *lin, const struct MonBounds *b, u8 *dst, s32 dw, s32 dh, s32 lean)
+{
+    s32 cw = b->maxX - b->minX + 1;
+    s32 ch = b->maxY - b->minY + 1;
+    s32 cw2, ch2, room, cx2, foot2, x, y;
+    s16 colSx[MON_W];       // source column for each destination column (before lean)
+    s16 rowSy[MON_H];       // source row for each destination row
+    s16 rowShift[MON_H];    // lean offset for each destination row
+
+    // keep the result on the 64x64 canvas (stretching needs empty room above / beside it)
+    if (dh > b->minY) dh = b->minY;
+    room = b->minX < (MON_W - 1 - b->maxX) ? b->minX : (MON_W - 1 - b->maxX);
+    if (dw > room * 2) dw = room * 2;
+    if (ch + dh < 4) dh = 4 - ch;
+    if (cw + dw < 4) dw = 4 - cw;
+    cw2 = cw + dw;
+    ch2 = ch + dh;
+    cx2 = b->minX + b->maxX + 1;        // twice the horizontal centre
+    foot2 = 2 * (b->maxY + 1);          // twice the y of the line under the feet
+
+    for (x = 0; x < MON_W; x++)
+    {
+        s32 d2 = (2 * x + 1) - cx2;     // twice the distance from the centre, at the pixel's centre
+        s32 n = cx2 * cw2 + d2 * cw;    // source x = n / (2 * cw2)
+
+        colSx[x] = FloorDiv(n, 2 * cw2);
+    }
+    for (y = 0; y < MON_H; y++)
+    {
+        s32 d2 = foot2 - (2 * y + 1);   // twice the height above the feet
+        s32 n = foot2 * ch2 - d2 * ch;  // source y = n / (2 * ch2)
+        s32 a = lean * (d2 > 0 ? d2 : 0);
+
+        rowSy[y] = n < 0 ? -1 : n / (2 * ch2);
+        rowShift[y] = (a + (a >= 0 ? ch2 : -ch2)) / (2 * ch2);
+    }
+
+    for (y = 0; y < MON_H; y++)
+    {
+        const u8 *row;
+
+        if (rowSy[y] < 0 || rowSy[y] >= MON_H)
+            continue;
+        row = lin + rowSy[y] * MON_W;
+        for (x = 0; x < MON_W; x++)
+        {
+            s32 sx = colSx[x] - rowShift[y];
+            u8 c;
+
+            if (sx < 0 || sx >= MON_W)
+                continue;
+            c = row[sx];
+            if (c)
+                dst[((y >> 3) * 8 + (x >> 3)) * 32 + (y & 7) * 4 + ((x & 7) >> 1)] |= c << ((x & 1) * 4);
+        }
+    }
+}
+// END_POSE_ENGINE
+
+// ---- Poses. Sizes are in pixels for a ~50 pixel tall Pokemon; TITLE_MON_SQUASH scales them.
+enum
+{
+    POSE_REST,
+    POSE_BREATH,    // one row taller: idle breathing
+    POSE_CROUCH_A,  // anticipation, light
+    POSE_CROUCH_B,  // anticipation, deep (also the landing squash)
+    POSE_LAUNCH,    // taking off: tall and thin
+    POSE_RISE,      // going up, leaning back
+    POSE_APEX,
+    POSE_FALL,      // coming down, leaning forward
+    POSE_OVERSHOOT, // little rebound after landing
+    POSE_COUNT
+};
+
+static const struct TitlePose sTitlePoses[POSE_COUNT] =
+{
+    [POSE_REST]      = {  0,  0,  0 },
+    [POSE_BREATH]    = {  0,  1,  0 },
+    [POSE_CROUCH_A]  = {  2, -2,  0 },
+    [POSE_CROUCH_B]  = {  4, -4,  0 },
+    [POSE_LAUNCH]    = { -2,  4,  0 },
+    [POSE_RISE]      = { -2,  3, -1 },
+    [POSE_APEX]      = { -1,  1,  0 },
+    [POSE_FALL]      = { -2,  3,  1 },
+    [POSE_OVERSHOOT] = { -1,  2,  0 },
+};
+
+// The hop. `hop` is the height in eighths of TITLE_MON_BOB (8 = top of the jump); each step
+// is held for `frames` frames. Edit freely: it is just a list of poses.
+struct TitleStep { u8 pose; u8 hop; u8 frames; };
+
+static const struct TitleStep sTitleHop[] =
+{
+    { POSE_CROUCH_A,  0, 3 },
+    { POSE_CROUCH_B,  0, 4 },
+    { POSE_LAUNCH,    2, 2 },
+    { POSE_RISE,      5, 2 },
+    { POSE_RISE,      7, 2 },
+    { POSE_APEX,      8, 4 },
+    { POSE_FALL,      7, 2 },
+    { POSE_FALL,      5, 2 },
+    { POSE_FALL,      2, 1 },
+    { POSE_CROUCH_B,  0, 4 },
+    { POSE_CROUCH_A,  0, 3 },
+    { POSE_OVERSHOOT, 0, 3 },
+};
+
+// 64x64, 16 colours. No affine: every pixel is drawn 1:1.
 static const struct OamData sTitleMonOam =
 {
-    .affineMode = ST_OAM_AFFINE_DOUBLE,
+    .affineMode = ST_OAM_AFFINE_OFF,
     .shape = 0,     // square
     .size = 3,      // 64x64
     .priority = 0,
@@ -435,61 +608,11 @@ static const struct SpriteTemplate sTitleMonTemplate =
     .callback = SpriteCB_TitleMon,
 };
 
-// Builds the OAM affine matrix directly so the units are unambiguous:
-//   zoomX/zoomY: 0x100 = 100%, 0x200 = 200%, 0x80 = 50%  (must be > 0)
-//   rot:         0-255 per full turn
-// The hardware matrix maps screen -> texture, so it holds the INVERSE of the zoom.
-static void SetTitleMonMatrix(u8 matrixNum, s16 zoomX, s16 zoomY, s16 rot)
-{
-    s32 invX = 0x10000 / zoomX;
-    s32 invY = 0x10000 / zoomY;
-    s32 sin = Sine(rot & 0xFF, 256);
-    s32 cos = Sine((rot + 64) & 0xFF, 256);
-
-    SetOamMatrix(matrixNum,
-                 (cos * invX) >> 8,
-                 (sin * invX) >> 8,
-                 (-sin * invY) >> 8,
-                 (cos * invY) >> 8);
-}
-
-// Idles at EXACT 1:1 (crisp, no resampling), and does a short hop/squash/sway once
-// per TITLE_MON_PULSE_PERIOD frames. sprite->data[0] = frame in period, [1] = pop-in.
-static void SpriteCB_TitleMon(struct Sprite *sprite)
-{
-    s16 t = sprite->data[0];
-    s16 base = 0x100, squash = 0, sway = 0, hop = 0;
-
-    if (sprite->data[1] < TITLE_MON_POP_FRAMES)
-    {
-        // grow in from 25% to 100%
-        base = 0x40 + (0xC0 * sprite->data[1]) / TITLE_MON_POP_FRAMES;
-        sprite->data[1]++;
-    }
-    else if (t >= TITLE_MON_PULSE_START && t < TITLE_MON_PULSE_START + TITLE_MON_PULSE_LEN)
-    {
-        s16 u = t - TITLE_MON_PULSE_START;
-        s16 half = Sine((u * 128) / TITLE_MON_PULSE_LEN, 256);   // 0 -> 256 -> 0
-
-        squash = (half * TITLE_MON_BREATHE) >> 8;
-        hop = (half * TITLE_MON_BOB) >> 8;
-        sway = Sine((u * 256) / TITLE_MON_PULSE_LEN, TITLE_MON_SWAY);
-    }
-
-    if (base == 0x100 && squash == 0 && sway == 0)
-        SetOamMatrix(sprite->oam.matrixNum, 0x100, 0, 0, 0x100);   // identity: pixel-perfect
-    else
-        SetTitleMonMatrix(sprite->oam.matrixNum, base + squash, base - squash, sway);
-
-    sprite->pos2.y = -hop;
-    sprite->data[0] = (t + 1 >= TITLE_MON_PULSE_PERIOD) ? 0 : t + 1;
-}
+// sprite->data: [0] frame in the cycle  [1] pose to show next frame  [2],[3] pose buffer pointer
+//               [4] hop (eighths) to show next frame  [5] pose now in VRAM  [6] shadow strength now
+#define MON_PTR(s)  ((u8 *)(((u32)(u16)(s)->data[3] << 16) | (u16)(s)->data[2]))
 
 #if TITLE_MON_SHADOW
-static void SpriteCB_TitleShadow(struct Sprite *sprite)
-{
-}
-
 // Priority 1 (behind the Pokemon's priority 0) and semi-transparent, so it darkens
 // the scene underneath instead of being an opaque blob.
 static const struct OamData sTitleShadowOam =
@@ -502,6 +625,10 @@ static const struct OamData sTitleShadowOam =
     .paletteNum = 1,
     .tileNum = 64,
 };
+
+static void SpriteCB_TitleShadow(struct Sprite *sprite)
+{
+}
 
 static const struct SpriteTemplate sTitleShadowTemplate =
 {
@@ -517,13 +644,113 @@ static const struct SpriteTemplate sTitleShadowTemplate =
 static const u16 sTitleShadowPal[16] = { 0, RGB(0, 0, 0), RGB(7, 7, 10) };
 #endif
 
+// Runs once per frame at the top of the main loop (right after VBlank), when the beam is
+// still far above the Pokemon, so copying a pose into VRAM here can never tear. Position
+// is applied by the OAM copy in the next VBlank, so the pose and shadow chosen last frame
+// are applied now to land on screen in the same frame as that position.
+static void SpriteCB_TitleMon(struct Sprite *sprite)
+{
+    s16 t = sprite->data[0];
+    u8 pose = POSE_REST, hop = 0;
+    u8 *poses = MON_PTR(sprite);
+
+    if (poses != NULL && sprite->data[1] != sprite->data[5])
+    {
+        CpuFastCopy(poses + sprite->data[1] * MON_BYTES, (void *)TITLE_MON_TILES_VRAM, MON_BYTES);
+        sprite->data[5] = sprite->data[1];
+    }
+#if TITLE_MON_SHADOW
+    {
+        s16 eva = 7 - (sprite->data[4] >> 1);   // shadow gets lighter while the Pokemon is in the air
+
+        if (eva != sprite->data[6])
+        {
+            SetGpuReg(REG_OFFSET_BLDALPHA, BLDALPHA_BLEND(eva, 16 - eva));
+            sprite->data[6] = eva;
+        }
+    }
+#endif
+
+    if (t < TITLE_MON_IDLE_FRAMES)
+    {
+#if TITLE_MON_BREATHE_FRAMES > 0
+        if ((t / TITLE_MON_BREATHE_FRAMES) & 1)
+            pose = POSE_BREATH;
+#endif
+    }
+    else
+    {
+        u32 i;
+        s16 u = t - TITLE_MON_IDLE_FRAMES;
+
+        for (i = 0; i < ARRAY_COUNT(sTitleHop); i++)
+        {
+            if (u < sTitleHop[i].frames)
+                break;
+            u -= sTitleHop[i].frames;
+        }
+        if (i == ARRAY_COUNT(sTitleHop))    // sequence finished: back to idle
+        {
+            t = 0;
+        }
+        else
+        {
+            pose = sTitleHop[i].pose;
+            hop = sTitleHop[i].hop;
+        }
+    }
+
+    sprite->pos2.y = -((hop * TITLE_MON_BOB) >> 3);
+    sprite->data[1] = pose;
+    sprite->data[4] = hop;
+    sprite->data[0] = t + 1;
+}
+
+// Builds every pose from the species' own sprite. Returns the pose buffer, or NULL if the
+// heap is too small (the Pokemon then just stays a static sprite that hops).
+static u8 *BuildTitleMonPoses(void)
+{
+    u8 *packed = AllocZeroed(MON_BYTES);
+    u8 *lin = AllocZeroed(MON_W * MON_H);
+    u8 *poses = AllocZeroed(POSE_COUNT * MON_BYTES);
+    struct MonBounds bounds;
+    u32 i;
+
+    if (packed == NULL || lin == NULL || poses == NULL)
+    {
+        if (packed != NULL) Free(packed);
+        if (lin != NULL) Free(lin);
+        if (poses != NULL) Free(poses);
+        return NULL;
+    }
+
+    LZDecompressWram(gMonFrontPicTable[TITLE_MON_SPECIES].data, packed);
+    UnpackMon(packed, lin);
+    FindMonBounds(lin, &bounds);
+    for (i = 0; i < POSE_COUNT; i++)
+    {
+        RenderMonPose(lin, &bounds, poses + i * MON_BYTES,
+                      (sTitlePoses[i].dw * TITLE_MON_SQUASH) / 100,
+                      (sTitlePoses[i].dh * TITLE_MON_SQUASH) / 100,
+                      sTitlePoses[i].lean * TITLE_MON_LEAN);
+    }
+    Free(packed);
+    Free(lin);
+    return poses;
+}
+
 static void CreateTitleMon(void)
 {
     u8 id;
+    u8 *poses;
     struct Sprite *sprite;
 
-    LZDecompressVram(gMonFrontPicTable[TITLE_MON_SPECIES].data, (void *)TITLE_MON_TILES_VRAM);
     LoadCompressedPalette(gMonPaletteTable[TITLE_MON_SPECIES].data, 0x100, 0x20);  // OBJ palette 0
+    poses = BuildTitleMonPoses();
+    if (poses != NULL)
+        CpuFastCopy(poses, (void *)TITLE_MON_TILES_VRAM, MON_BYTES);               // the resting pose
+    else
+        LZDecompressVram(gMonFrontPicTable[TITLE_MON_SPECIES].data, (void *)TITLE_MON_TILES_VRAM);
 
 #if TITLE_MON_SHADOW
     {
@@ -546,9 +773,13 @@ static void CreateTitleMon(void)
         return;
 
     sprite = &gSprites[id];
-    InitSpriteAffineAnim(sprite);       // makes sure the sprite owns an OAM matrix
-    sprite->affineAnimPaused = TRUE;    // we drive the matrix ourselves, not the anim table
-    SetTitleMonMatrix(sprite->oam.matrixNum, 0x40, 0x40, 0);   // start small, like the first frame of the grow-in
+    sprite->data[0] = TITLE_MON_IDLE_FRAMES - TITLE_MON_FIRST_HOP_DELAY;   // first hop soon after the fade-in
+    sprite->data[1] = POSE_REST;
+    sprite->data[2] = (u32)poses & 0xFFFF;
+    sprite->data[3] = (u32)poses >> 16;
+    sprite->data[4] = 0;
+    sprite->data[5] = POSE_REST;
+    sprite->data[6] = 7;
 }
 
 #endif // TITLE_MON_SPECIES

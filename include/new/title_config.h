@@ -54,22 +54,22 @@
 #define TITLE_TEXT_COLOR      (31 | (31 << 5) | (31 << 10))
 
 // ---------------------------------------------------------------------------
-// Animated affine Pokemon (its normal front sprite from the ROM, so no art needed).
+// Animated Pokemon (its normal front sprite from the ROM, so no art needed).
 // Set TITLE_MON_SPECIES to 0 to disable it. Use any SPECIES_* from constants/species.h.
 // ---------------------------------------------------------------------------
 #define TITLE_MON_SPECIES SPECIES_SKITTY
 #define TITLE_MON_X       172   // sprite CENTRE, screen pixels (screen is 240x160)
 #define TITLE_MON_Y       108
 
-// It idles perfectly still (exact 1:1 pixels, so it stays crisp), then does a short
-// hop/squash/sway every few seconds. Affine scaling is nearest-neighbour, so on
-// pixel art smaller values = cleaner pixels. Set any of them to 0 to remove that motion.
-#define TITLE_MON_BREATHE 12    // squash/stretch, in 1/256ths (12 = about 5%)
-#define TITLE_MON_SWAY    3     // rotation, in 1/256ths of a turn (3 = about 4 degrees)
-#define TITLE_MON_BOB     4     // hop height in pixels
-#define TITLE_MON_PULSE_PERIOD 96   // frames between hops (96 = 1.6 s)
-#define TITLE_MON_PULSE_START  56   // frame within the period where the hop begins
-#define TITLE_MON_PULSE_LEN    36   // how long the hop lasts, in frames
+// No affine scaling/rotation: the sprite is re-drawn pixel by pixel into squash / stretch /
+// lean poses at start-up, so every frame is crisp pixel art. The hop itself (which poses,
+// in what order, for how long) is the sTitleHop[] list in src/title_screen.c.
+#define TITLE_MON_BOB     10    // hop height in pixels
+#define TITLE_MON_SQUASH  100   // squash/stretch strength in percent (0 = none, 150 = cartoony)
+#define TITLE_MON_LEAN    2     // lean while jumping, in pixels at the top of the sprite (0 = none)
+#define TITLE_MON_IDLE_FRAMES      70   // rest between hops (60 frames = 1 second)
+#define TITLE_MON_FIRST_HOP_DELAY  24   // frames after the screen appears before the first hop
+#define TITLE_MON_BREATHE_FRAMES   28   // idle breathing: grows one row every n frames (0 = off)
 
 // Soft translucent ground shadow under the Pokemon (helps it sit on the scene).
 #define TITLE_MON_SHADOW    1
